@@ -24,6 +24,7 @@ from weathergen.model.attention import (
     MultiSelfAttentionHeadVarlen,
 )
 from weathergen.model.blocks import CrossAttentionBlock, OriginalPredictionBlock, SelfAttentionBlock
+from weathergen.model.checkpointing import checkpoint_full_precision
 from weathergen.model.embeddings import (
     StreamEmbedLinear,
     StreamEmbedTransformer,
@@ -789,16 +790,20 @@ class TargetPredictionEngineClassic(nn.Module):
 
         for ib, block in enumerate(self.tte):
             if self.cf.pred_self_attention and ib % 3 == 1:
-                tc_tokens = checkpoint(block, tc_tokens, tcs_lens, tcs_aux, use_reentrant=False)
+                tc_tokens = checkpoint_full_precision(
+                    block,
+                    tc_tokens,
+                    tcs_lens,
+                    tcs_aux,
+                )
             else:
-                tc_tokens = checkpoint(
+                tc_tokens = checkpoint_full_precision(
                     block,
                     tc_tokens,
                     tokens_stream,
                     tcs_lens,
                     tokens_lens,
                     tcs_aux,
-                    use_reentrant=False,
                 )
         return tc_tokens
 
@@ -952,32 +957,29 @@ class TargetPredictionEngine(nn.Module):
         )
         for layer in self.tte:
             if isinstance(layer, OriginalPredictionBlock):
-                output = checkpoint(
+                output = checkpoint_full_precision(
                     layer,
                     latent=latent.flatten(0, 1),
                     output=output,
                     coords=coordinates,
                     latent_lens=latent_lens,
                     output_lens=output_lens,
-                    use_reentrant=False,
                 )
             elif isinstance(layer, CrossAttentionBlock):
-                output = checkpoint(
+                output = checkpoint_full_precision(
                     layer,
                     x=output,
                     x_kv=latent.flatten(0, 1),
                     x_lens=output_lens,
                     aux=latent[:, 0],
                     x_kv_lens=latent_lens,
-                    use_reentrant=False,
                 )
             else:
-                output = checkpoint(
+                output = checkpoint_full_precision(
                     layer,
                     x=output,
                     x_lens=output_lens,
                     aux=latent[:, 0],
-                    use_reentrant=False,
                 )
         output = (
             self.final_norm(output)
