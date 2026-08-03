@@ -146,6 +146,7 @@ The source path can be summarized as:
 source readers
     │
     ├─ same sample on every rank in a spatial group
+    ├─ Anemoi readers load only rank-local source points
     │
     ▼
 map every source location to nested HEALPix cell ID
@@ -184,8 +185,8 @@ query aggregation and global assimilation
 
 | Stage/data | Spatially sharded? |
 | --- | --- |
-| Source storage reads | No; each spatial rank currently reads the same source sample |
-| Source coordinate-to-HEALPix mapping | Computed independently on every spatial rank |
+| Source storage reads | Anemoi readers only; other reader backends remain replicated |
+| Source coordinate-to-HEALPix mapping | Cached once by Anemoi readers and recomputed during tokenization; other readers compute it during tokenization only |
 | Source filtering and token construction | Yes |
 | Per-stream embedding | Yes |
 | Local assimilation | Yes |
@@ -198,9 +199,49 @@ query aggregation and global assimilation
 | Physical loss after prediction gather | No |
 | Model parameters/FSDP state | Controlled separately by FSDP |
 
-The implementation reduces GPU source-token and activation memory, but does not yet perform
-distributed source I/O. Raw source reads and the coordinate mapping are replicated inside a
-spatial group.
+The initial distributed-I/O prototype is implemented for `DataReaderAnemoi` and its OPERAN
+subclass. Other readers still load the complete source window before rank-local tokenization.
+Targets remain global for every reader because target construction and loss processing still
+require global ordering.
+
+### Anemoi source-I/O prototype
+
+`MultiStreamDataSampler` packages the already-computed source ownership interval in a
+`HealpixDomain`. A reader opts into receiving it with
+`supports_source_spatial_subsetting = True`; readers without that capability are constructed
+exactly as before.
+
+During Anemoi reader construction:
+
+1. one source channel from the first valid timestep is read;
+2. its spatial-axis length is checked against the static latitude/longitude arrays;
+3. every coordinate is mapped to a nested HEALPix cell;
+4. the boolean mask for `[cell_start, cell_end)` is cached;
+5. the mask is converted into ordered contiguous point slices.
+
+The probe is done once per reader process. It prevents a mask built for a mismatched coordinate
+layout from being silently reused over all training windows.
+
+`get_source()` passes the cached mask to `_get()`. `_get()` applies the contiguous point slices
+in the Anemoi dataset index itself, before conversion to a NumPy array. Coordinates are selected
+with the same mask, so values, geoinfo fields, coordinates, and datetimes remain aligned. In
+contrast, `get_target()` calls the unmasked read path.
+
+Reader results record whether spatial selection was applied. This matters when a valid global
+window contains no points on one rank: the sampler must preserve that empty local source instead
+of replacing it with the global spoof field used for a genuinely unavailable time window. The
+encoder's existing empty-domain path then keeps distributed ranks in lockstep.
+
+Contiguous slices are used because the pinned Anemoi dataset wrapper expands a list index into
+one read per point. A rank-local mask on a regular grid normally becomes a much smaller number
+of runs. Startup logging reports both the retained point count and the number of slice reads;
+an unexpectedly high slice count identifies a storage-order/backend combination that needs a
+reader-specific indexing strategy.
+
+Actual bytes saved depend on the Zarr chunk layout. If every spatial chunk contains the full
+grid, selecting points can reduce materialized arrays and downstream CPU work but cannot avoid
+reading those full chunks from storage. Spatially partitioned chunks are required for the I/O
+volume to scale closely with the rank-local domain.
 
 ## Rank-local stream construction
 
@@ -627,6 +668,8 @@ Compare:
 | --- | --- |
 | Local construction equivalence | Concatenated local cell lists equal global construction cell-by-cell |
 | Invalid local range | Out-of-range cell intervals are rejected |
+| Reader domain mask | Reader coordinates select exactly the owned nested HEALPix cells |
+| Reader storage slices | Boolean point masks become ordered contiguous reads |
 | Packed-token selection | Complete cells are selected across multiple input-step/sample rows |
 | Coverage and gradients | Shards cover every packed token exactly once and preserve gradients |
 | Invalid packed ranges | Invalid cell intervals are rejected |
@@ -657,7 +700,7 @@ Memory that should decrease includes:
 Memory that remains replicated or becomes global includes:
 
 - model parameters, gradients, and optimizer state according to the FSDP configuration;
-- source-reader CPU data before local filtering;
+- source-reader CPU data before local filtering for readers without source-I/O subsetting;
 - target tensors and target-side computation;
 - the dense gathered global latent tensor;
 - query aggregation;
@@ -687,6 +730,22 @@ Verify:
 - `data_parallel_world_size: 1` for a four-rank spatial-only run;
 - all four ownership messages appear in the startup log;
 - each source stream has a rank-local token count.
+
+### Source I/O does not decrease
+
+First confirm that the stream uses `DataReaderAnemoi` or `DataReaderAnemoiOperan`; all other
+reader backends still use replicated source reads in this prototype. Then inspect the startup
+message:
+
+```text
+<stream>: source I/O keeps <local>/<global> points ... using <runs> reads
+```
+
+`local/global` should be close to `1 / spatial_parallel_size` for a globally distributed grid.
+A large number of runs means that the storage point order fragments this rank's geographic
+domain. Finally, inspect the source Zarr array's last-axis chunk size: selecting a subset of a
+chunk still requires the backend to fetch that chunk, so full-grid spatial chunks prevent a
+proportional reduction in bytes read.
 
 ### `nvidia-smi` remains high
 
@@ -741,8 +800,10 @@ Confirm that:
 | `config/default_config.yml` | Default spatial size |
 | `config/encoder_spatial_parallel_4.yml` | Four-rank override |
 | `config/encoder_spatial_parallel_8.yml` | Eight-rank override |
-| `src/weathergen/datasets/healpix_domain.py` | Rank-local point grouping |
-| `src/weathergen/datasets/multi_stream_data_sampler.py` | Shared spatial-group samples, local ownership, and runtime logging |
+| `src/weathergen/datasets/healpix_domain.py` | Rank-local domains, reader masks, storage slices, and point grouping |
+| `src/weathergen/datasets/data_reader_base.py` | Opt-in source-read hook and reader capability contract |
+| `src/weathergen/datasets/data_reader_anemoi.py` | Constructor-time domain mask and rank-local source storage reads |
+| `src/weathergen/datasets/multi_stream_data_sampler.py` | Shared spatial-group samples, local ownership, reader-domain handoff, and runtime logging |
 | `src/weathergen/datasets/stream_data.py` | Separate source-local and target-global cell counts |
 | `src/weathergen/datasets/tokenizer_masking.py` | Local source tokenization range |
 | `src/weathergen/datasets/tokenizer_utils.py` | Nested HEALPix mapping and local token construction |
@@ -752,6 +813,7 @@ Confirm that:
 | `src/weathergen/train/trainer.py` | Effective data-parallel batch and scheduler semantics |
 | `src/weathergen/utils/distributed.py` | Spatial group validation and construction |
 | `tests/test_encoder_spatial_parallel.py` | Cell ownership, ordering, coverage, validation, and gradient tests |
+| `tests/test_anemoi_spatial_io.py` | Pre-materialization Anemoi point selection |
 
 ## Commit-by-commit design history
 

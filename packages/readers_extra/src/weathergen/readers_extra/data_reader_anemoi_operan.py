@@ -13,6 +13,7 @@ from typing import override
 
 import numpy as np
 from anemoi.datasets.data import MissingDateError
+from numpy.typing import NDArray
 
 from weathergen.datasets.data_reader_anemoi import DataReaderAnemoi
 from weathergen.datasets.data_reader_base import (
@@ -20,6 +21,7 @@ from weathergen.datasets.data_reader_base import (
     TimeWindowHandler,
     TIndex,
 )
+from weathergen.datasets.healpix_domain import HealpixDomain
 from weathergen.train.utils import Stage
 
 _logger = logging.getLogger(__name__)
@@ -65,6 +67,7 @@ class DataReaderAnemoiOperan(DataReaderAnemoi):
         filename: Path,
         stream_info: dict,
         stage: Stage,
+        source_spatial_domain: HealpixDomain | None = None,
     ) -> None:
         """
         Construct data reader for anemoi dataset
@@ -75,16 +78,23 @@ class DataReaderAnemoiOperan(DataReaderAnemoi):
             filename (and path) of dataset
         stream_info :
             information about stream
+        source_spatial_domain :
+            optional rank-local HEALPix domain applied to source reads only
 
         Returns
         -------
         None
         """
 
-        super().__init__(tw_handler, filename, stream_info, stage)
+        super().__init__(tw_handler, filename, stream_info, stage, source_spatial_domain)
 
     @override
-    def _get(self, idx: TIndex, channels_idx: list[int]) -> ReaderData:
+    def _get(
+        self,
+        idx: TIndex,
+        channels_idx: list[int],
+        spatial_mask: NDArray[np.bool_] | None = None,
+    ) -> ReaderData:
         """
         Get data for window (for either source or target, through public interface)
 
@@ -145,7 +155,7 @@ class DataReaderAnemoiOperan(DataReaderAnemoi):
         # subsetting is pushed to the ctor via frequency argument; this also ensures that no sub-
         # sampling is required here
         try:
-            data = self.ds[didx_start:didx_end][:, :, 0].astype(np.float32)
+            data = self._read_data(didx_start, didx_end, spatial_mask)
         except MissingDateError as e:
             _logger.debug(f"Date not present in anemoi dataset: {str(e)}. Skipping.")
             return ReaderData.empty(
@@ -168,6 +178,8 @@ class DataReaderAnemoiOperan(DataReaderAnemoi):
             ],
             axis=0,
         ).transpose()
+        if spatial_mask is not None:
+            latlon = latlon[spatial_mask]
         # repeat latlon len(t_idxs) times
         coords = np.vstack((latlon,) * len(t_idxs))
 
@@ -180,6 +192,7 @@ class DataReaderAnemoiOperan(DataReaderAnemoi):
             geoinfos=geoinfos,
             data=data,
             datetimes=datetimes,
+            is_spatial_subset=spatial_mask is not None,
         )
         # check_reader_data(rd, dtr)
 

@@ -133,6 +133,7 @@ class IOReaderData:
     data: NDArray[DType]
     datetimes: NDArray[NPDT64]
     is_spoof: bool = False
+    is_spatial_subset: bool = False
 
     def is_empty(self):
         """
@@ -175,6 +176,7 @@ class IOReaderData:
         data = np.zeros((0, other.data.shape[1]), dtype=other.data.dtype)
         datetimes = np.array([], dtype=other.datetimes.dtype)
         is_spoof = True
+        is_spatial_subset = False
 
         for other in others:
             n_datapoints = len(other.data)
@@ -187,8 +189,16 @@ class IOReaderData:
             data = np.concatenate([data, other.data])
             datetimes = np.concatenate([datetimes, other.datetimes])
             is_spoof = is_spoof and other.is_spoof
+            is_spatial_subset = is_spatial_subset or getattr(other, "is_spatial_subset", False)
 
-        return cls(coords, geoinfos, data, datetimes, is_spoof)
+        return cls(
+            coords=coords,
+            geoinfos=geoinfos,
+            data=data,
+            datetimes=datetimes,
+            is_spoof=is_spoof,
+            is_spatial_subset=is_spatial_subset,
+        )
 
 
 @dataclasses.dataclass

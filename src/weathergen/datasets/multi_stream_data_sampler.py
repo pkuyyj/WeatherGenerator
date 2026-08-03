@@ -26,6 +26,7 @@ from weathergen.datasets.data_reader_base import (
     TIndex,
 )
 from weathergen.datasets.data_reader_obs import DataReaderObs
+from weathergen.datasets.healpix_domain import HealpixDomain
 from weathergen.datasets.masking import Masker
 from weathergen.datasets.stream_data import StreamData, spoof
 from weathergen.datasets.tokenizer_masking import TokenizerMasking
@@ -120,6 +121,15 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self.local_num_healpix_cells = self.num_healpix_cells // spatial_parallel_size
         self.local_cell_start = self.spatial_parallel_rank * self.local_num_healpix_cells
         self.local_cell_end = self.local_cell_start + self.local_num_healpix_cells
+        self.source_spatial_domain = (
+            HealpixDomain(
+                self.healpix_level,
+                self.local_cell_start,
+                self.local_cell_end,
+            )
+            if spatial_parallel_size > 1
+            else None
+        )
         self.masker = Masker(cf.healpix_level, stage, cf.streams, self.mode_cfg)
         self.tokenizer = TokenizerMasking(
             cf.healpix_level,
@@ -267,6 +277,9 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                         msg = f"Unsupported stream type {stream_info['type']}"
                         f"for stream name '{stream_name}'."
                         raise ValueError(msg)
+
+            if dataset.supports_source_spatial_subsetting:
+                kwargs["source_spatial_domain"] = self.source_spatial_domain
 
             for fname in stream_info.get("filenames", [pathlib.Path()]):
                 fname = pathlib.Path(fname)
@@ -599,7 +612,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
             rdata = collect_datasources(stream_ds, idx, "source", self.rng)
 
-            if rdata.is_empty():
+            if rdata.is_empty() and not rdata.is_spatial_subset:
                 # work around for https://github.com/pytorch/pytorch/issues/158719
                 # create non-empty mean data instead of empty tensor
                 time_win = self.time_window_handler.window(idx)

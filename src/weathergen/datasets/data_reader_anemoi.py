@@ -26,6 +26,11 @@ from weathergen.datasets.data_reader_base import (
     TIndex,
     check_reader_data,
 )
+from weathergen.datasets.healpix_domain import (
+    HealpixDomain,
+    build_healpix_domain_mask,
+    mask_to_contiguous_slices,
+)
 from weathergen.train.utils import Stage
 from weathergen.utils.distributed import is_root
 
@@ -35,12 +40,15 @@ _logger = logging.getLogger(__name__)
 class DataReaderAnemoi(DataReaderTimestep):
     "Wrapper for Anemoi datasets"
 
+    supports_source_spatial_subsetting = True
+
     def __init__(
         self,
         tw_handler: TimeWindowHandler,
         filename: Path,
         stream_info: dict,
         stage: Stage,
+        source_spatial_domain: HealpixDomain | None = None,
     ) -> None:
         """
         Construct data reader for anemoi dataset
@@ -51,11 +59,17 @@ class DataReaderAnemoi(DataReaderTimestep):
             filename (and path) of dataset
         stream_info :
             information about stream
+        source_spatial_domain :
+            optional rank-local HEALPix domain applied to source reads only
 
         Returns
         -------
         None
         """
+
+        self.source_spatial_domain = source_spatial_domain
+        self.source_spatial_mask: NDArray[np.bool_] | None = None
+        self.source_spatial_slices: list[slice] | None = None
 
         # use anemoi_config if it's defined; ignore filename in this case
         data_paths = stream_info.get("data_paths", [])
@@ -169,6 +183,9 @@ class DataReaderAnemoi(DataReaderTimestep):
         self.mean = ds.statistics["mean"]
         self.stdev = ds.statistics["stdev"]
 
+        if self.source_spatial_domain is not None and len(self.source_idx) > 0:
+            self._init_source_spatial_mask()
+
     @override
     def init_empty(self) -> None:
         super().init_empty()
@@ -179,8 +196,88 @@ class DataReaderAnemoi(DataReaderTimestep):
     def length(self) -> int:
         return self.len
 
+    def _init_source_spatial_mask(self) -> None:
+        """Probe one timestep and cache the rank-local source-grid selection."""
+
+        assert self.ds is not None
+        coords = np.column_stack((self.latitudes, self.longitudes))
+
+        # Read one source field once during construction. Besides following the
+        # same path as regular data access, this verifies that the static
+        # coordinate arrays align with the dataset's spatial axis before the
+        # selection is reused for every subsequent source window.
+        probe_channel = int(self.source_idx[0])
+        first_available_idx = next(
+            (idx for idx in range(self.len) if idx not in self.ds.missing),
+            None,
+        )
+        if first_available_idx is None:
+            _logger.warning("Cannot initialize source spatial mask: dataset has no valid dates.")
+            return
+
+        first_step = self.ds[
+            first_available_idx,
+            slice(probe_channel, probe_channel + 1),
+            0,
+            slice(None),
+        ]
+        if first_step.shape[-1] != coords.shape[0]:
+            raise ValueError(
+                "Anemoi coordinate count does not match the spatial data axis: "
+                f"{coords.shape[0]} != {first_step.shape[-1]}"
+            )
+
+        self.source_spatial_mask = build_healpix_domain_mask(
+            coords,
+            self.source_spatial_domain,
+        )
+        self.source_spatial_slices = mask_to_contiguous_slices(self.source_spatial_mask)
+        _logger.info(
+            "%s: source I/O keeps %d/%d points in HEALPix cells [%d, %d) using %d reads",
+            self.stream_info["name"],
+            np.count_nonzero(self.source_spatial_mask),
+            self.source_spatial_mask.size,
+            self.source_spatial_domain.cell_start,
+            self.source_spatial_domain.cell_end,
+            len(self.source_spatial_slices),
+        )
+
     @override
-    def _get(self, idx: TIndex, channels_idx: list[int]) -> ReaderData:
+    def _get_source(self, idx: TIndex) -> ReaderData:
+        return self._get(idx, self.source_idx, self.source_spatial_mask)
+
+    def _read_data(
+        self,
+        didx_start: int,
+        didx_end: int,
+        spatial_mask: NDArray[np.bool_] | None,
+    ) -> NDArray[np.float32]:
+        """Read a time range, optionally selecting source points at storage access."""
+
+        if spatial_mask is None:
+            return self.ds[didx_start:didx_end][:, :, 0].astype(np.float32)
+
+        spatial_slices = (
+            self.source_spatial_slices
+            if spatial_mask is self.source_spatial_mask and self.source_spatial_slices is not None
+            else mask_to_contiguous_slices(spatial_mask)
+        )
+        if not spatial_slices:
+            return np.empty((didx_end - didx_start, len(self.ds.variables), 0), np.float32)
+
+        parts = [
+            self.ds[didx_start:didx_end, :, 0, point_slice].astype(np.float32)
+            for point_slice in spatial_slices
+        ]
+        return np.concatenate(parts, axis=-1)
+
+    @override
+    def _get(
+        self,
+        idx: TIndex,
+        channels_idx: list[int],
+        spatial_mask: NDArray[np.bool_] | None = None,
+    ) -> ReaderData:
         """
         Get data for window (for either source or target, through public interface)
 
@@ -213,7 +310,7 @@ class DataReaderAnemoi(DataReaderTimestep):
         # subsetting is pushed to the ctor via frequency argument; this also ensures that no sub-
         # sampling is required here
         try:
-            data = self.ds[didx_start:didx_end][:, :, 0].astype(np.float32)
+            data = self._read_data(didx_start, didx_end, spatial_mask)
         except MissingDateError as e:
             _logger.debug(f"Date not present in anemoi dataset: {str(e)}. Skipping.")
             return ReaderData.empty(
@@ -236,6 +333,8 @@ class DataReaderAnemoi(DataReaderTimestep):
             ],
             axis=0,
         ).transpose()
+        if spatial_mask is not None:
+            latlon = latlon[spatial_mask]
         # repeat latlon len(t_idxs) times
         coords = np.vstack((latlon,) * len(t_idxs))
 
@@ -248,6 +347,7 @@ class DataReaderAnemoi(DataReaderTimestep):
             geoinfos=geoinfos,
             data=data,
             datetimes=datetimes,
+            is_spatial_subset=spatial_mask is not None,
         )
         check_reader_data(rd, dtr)
 

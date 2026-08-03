@@ -156,6 +156,7 @@ class ReaderData:
     data: NDArray[DType]
     datetimes: NDArray[NPDT64]
     is_spoof: bool = False
+    is_spatial_subset: bool = False
 
     @staticmethod
     def empty(num_data_fields: int, num_geo_fields: int) -> "ReaderData":
@@ -173,6 +174,7 @@ class ReaderData:
             data=np.zeros((0, num_data_fields), dtype=np.float32),
             datetimes=np.zeros((0,), dtype=np.datetime64),
             is_spoof=False,
+            is_spatial_subset=False,
         )
 
     def is_empty(self):
@@ -206,10 +208,12 @@ class ReaderData:
 
         # apply
         return ReaderData(
-            self.coords[idx_valid],
-            self.geoinfos[idx_valid],
-            self.data[idx_valid],
-            self.datetimes[idx_valid],
+            coords=self.coords[idx_valid],
+            geoinfos=self.geoinfos[idx_valid],
+            data=self.data[idx_valid],
+            datetimes=self.datetimes[idx_valid],
+            is_spoof=self.is_spoof,
+            is_spatial_subset=self.is_spatial_subset,
         )
 
     def shuffle(self, rng, shuffle: bool, num_subset: int) -> "ReaderData":
@@ -311,6 +315,11 @@ class DataReaderBase(metaclass=ABCMeta):
     geoinfo_idx: list[int] = abstract_attribute()
     target_channel_weights: list[float] = abstract_attribute()
 
+    # Opt-in capability used by MultiStreamDataSampler. Readers that enable it
+    # accept a ``source_spatial_domain`` constructor argument and apply that
+    # domain before source values are materialized from storage.
+    supports_source_spatial_subsetting = False
+
     def __init__(
         self,
         tw_handler: TimeWindowHandler,
@@ -385,9 +394,13 @@ class DataReaderBase(metaclass=ABCMeta):
         source data (coords, geoinfos, data, datetimes)
         """
 
-        rdata = self._get(idx, self.source_idx)
+        rdata = self._get_source(idx)
 
         return rdata
+
+    def _get_source(self, idx: TIndex) -> ReaderData:
+        """Reader-specific source hook; defaults to the regular read path."""
+        return self._get(idx, self.source_idx)
 
     def get_target(self, idx: TIndex) -> ReaderData:
         """

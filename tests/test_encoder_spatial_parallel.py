@@ -10,8 +10,15 @@
 import numpy as np
 import pytest
 import torch
+from astropy import units as u
+from astropy_healpix import healpix_to_lonlat
 
-from weathergen.datasets.healpix_domain import build_local_healpix_cell_splits
+from weathergen.datasets.healpix_domain import (
+    HealpixDomain,
+    build_healpix_domain_mask,
+    build_local_healpix_cell_splits,
+    mask_to_contiguous_slices,
+)
 from weathergen.model.spatial_parallel import (
     reassemble_packed_cell_shards,
     select_healpix_neighborhood_shard,
@@ -79,6 +86,41 @@ def test_local_healpix_construction_handles_empty_domain():
 
     assert len(cell_splits) == 3
     assert all(cell.dtype == np.int64 and cell.size == 0 for cell in cell_splits)
+
+
+def test_reader_domain_mask_matches_nested_healpix_ownership():
+    level = 1
+    cell_ids = np.array([0, 3, 4, 7, 8, 11, 20, 35, 47])
+    lon, lat = healpix_to_lonlat(cell_ids, nside=2**level, order="nested")
+    # Reader longitudes are shifted by 180 degrees before the tokenizer maps
+    # them to HEALPix phi.
+    coords = np.column_stack((lat.to_value(u.deg), lon.to_value(u.deg) - 180.0))
+    domain = HealpixDomain(level, cell_start=4, cell_end=12)
+
+    mask = build_healpix_domain_mask(coords, domain)
+
+    assert mask.tolist() == [False, False, True, True, True, True, False, False, False]
+
+
+def test_reader_domain_mask_drops_non_finite_coordinates():
+    coords = np.array([[0.0, 0.0], [np.nan, 0.0], [0.0, np.inf]])
+
+    mask = build_healpix_domain_mask(coords, HealpixDomain(0, 0, 12))
+
+    assert mask.tolist() == [True, False, False]
+
+
+def test_reader_domain_rejects_invalid_level():
+    with pytest.raises(ValueError, match="non-negative integer"):
+        HealpixDomain(-1, 0, 1)
+
+
+def test_point_mask_is_converted_to_ordered_contiguous_read_slices():
+    mask = np.array([False, True, True, False, True, False, True, True, True])
+
+    slices = mask_to_contiguous_slices(mask)
+
+    assert [(item.start, item.stop) for item in slices] == [(1, 3), (4, 5), (6, 9)]
 
 
 def test_select_packed_cell_shard_preserves_cell_boundaries_across_rows():
