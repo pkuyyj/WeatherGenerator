@@ -128,3 +128,21 @@ def test_nvtx_patched_restores_the_original():
         assert torch.nn.utils.clip_grad_norm_ is not original
 
     assert torch.nn.utils.clip_grad_norm_ is original
+
+
+def test_compute_source_bytes_with_empty_streams_and_steps():
+    from types import SimpleNamespace
+
+    from weathergen.utils.performance import compute_source_bytes
+
+    source = SimpleNamespace(samples=[
+        SimpleNamespace(streams_data={
+            "absent": None,
+            "partial": SimpleNamespace(source_tokens_cells=[
+                torch.ones(2, 3, dtype=torch.float32), None,
+                torch.zeros(4, dtype=torch.bfloat16), torch.empty(0),
+            ]),
+            "empty": SimpleNamespace(source_tokens_cells=[None]),
+        }),
+    ])
+    assert compute_source_bytes(source) == 32
